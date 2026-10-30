@@ -505,7 +505,9 @@ def wuji_hand2_pen_spin_env_cfg(*, play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
   }
   if play:
-    cfg.terminations.pop("object_position_error")
+    # Allow ordinary tracking errors, but restart once the pen is lost instead
+    # of continuing to act on a dropped pen until the reference clip ends.
+    cfg.terminations["object_position_error"].params["threshold"] = 0.20
     cfg.terminations.pop("object_orientation_error")
 
   _configure_hand2_domain_randomization(cfg, play=play)
