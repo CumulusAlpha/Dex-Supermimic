@@ -21,6 +21,7 @@ from dex_supermimic.tasks.dex_reorient.utils.curriculum import disturbance_speed
 
 from .rotations import mv, quat_to_mat
 from .metrics import MetricLogger
+from .ppo_logging import PPOLogStats, format_ppo_log, organize_ppo_scalars
 from .buffer import ReplayBuffer
 from .common import RunningNorm
 from .mdp import angle_error
@@ -258,6 +259,7 @@ class DexSuperMimicRunner:
         self.wall_offset = 0.0
         self.started_at = time.perf_counter()
         if cfg.algorithm == "ppo":
+            self.ppo_log_stats = PPOLogStats(env.num_envs, self.device)
             # PPO resets episodes automatically; curriculum depends only on real outcomes.
             self.env.cfg.auto_reset = True
         else:
@@ -945,6 +947,8 @@ class DexSuperMimicRunner:
         self.env.cfg.auto_reset = True
         self.env._manual_reset_pending.zero_()
         gamma = self.cfg.ppo_gamma
+        action_stds = []
+        step_rewards = []
         for t in range(steps):
             self.actor.norm.update(self.obs)
             distribution = self.actor.distribution(self.obs)
@@ -953,7 +957,10 @@ class DexSuperMimicRunner:
             critic = self._ensure_ppo_critic(critic_obs)
             self.ppo_critic.norm.update(critic_obs)
             value = critic(critic_obs)
-            obs, reward, terminated, truncated, _ = self.env.step(action)
+            action_stds.append(distribution.stddev.mean())
+            obs, reward, terminated, truncated, extras = self.env.step(action)
+            self.ppo_log_stats.process_step(reward, terminated | truncated, extras)
+            step_rewards.append(reward.mean())
             # rsl-rl treats timeouts as done but adds a bootstrapping reward
             # correction before GAE. This reproduces upstream Wuji-MJLab exactly.
             reward = reward + gamma * value * truncated.float()
@@ -972,7 +979,8 @@ class DexSuperMimicRunner:
         drop_name = "reference_end" if self.is_pen else "cage_drop"
         drop = self.env.termination_manager.get_term(drop_name).float().mean()
         return dict(
-            reward=memory["reward"].mean(),
+            reward=torch.stack(step_rewards).mean(),
+            action_std=torch.stack(action_stds).mean(),
             drop_rate=drop,
             actor_loss=memory["log_prob"].square().mean(),
             critic_loss=memory["value"].square().mean(),
@@ -1000,19 +1008,21 @@ class DexSuperMimicRunner:
         rewards = memory["reward"]
         dones = (memory["terminated"].bool() | memory["truncated"].bool()).float()
         critic = self._ensure_ppo_critic(memory["critic_obs"])
-        final_value = critic(self._critic_observation()).flatten()
-        advantages = torch.zeros_like(rewards)
-        gae = torch.zeros(num_envs, device=self.device)
-        for t in reversed(range(batch)):
-            next_non_terminal = 1.0 - dones[t]
-            next_value = final_value if t == batch - 1 else memory["value"][t + 1]
-            delta = rewards[t] + c.ppo_gamma * next_non_terminal * next_value - memory["value"][t]
-            gae = delta + c.ppo_gamma * c.lam * next_non_terminal * gae
-            advantages[t] = gae
-        flat_advantages = advantages.reshape(-1)
-        returns = flat_advantages + flat_values
-        if c.ppo_normalize_advantage:
-            flat_advantages = (flat_advantages - flat_advantages.mean()) / flat_advantages.std().clamp_min(1e-8)
+        # Rollout targets stay fixed across every minibatch and PPO epoch.
+        with torch.no_grad():
+            final_value = critic(self._critic_observation()).flatten()
+            advantages = torch.zeros_like(rewards)
+            gae = torch.zeros(num_envs, device=self.device)
+            for t in reversed(range(batch)):
+                next_non_terminal = 1.0 - dones[t]
+                next_value = final_value if t == batch - 1 else memory["value"][t + 1]
+                delta = rewards[t] + c.ppo_gamma * next_non_terminal * next_value - memory["value"][t]
+                gae = delta + c.ppo_gamma * c.lam * next_non_terminal * gae
+                advantages[t] = gae
+            flat_advantages = advantages.reshape(-1)
+            returns = flat_advantages + flat_values
+            if c.ppo_normalize_advantage:
+                flat_advantages = (flat_advantages - flat_advantages.mean()) / flat_advantages.std().clamp_min(1e-8)
 
         count = batch * num_envs
         usable_count = (count // c.ppo_minibatches) * c.ppo_minibatches
@@ -1064,10 +1074,24 @@ class DexSuperMimicRunner:
 
     def learn_ppo(self):
         start = self.started_at
+        first_iteration = self.iteration
         for it in range(self.iteration, self.cfg.max_iterations):
             self.iteration = it
+            iteration_start = time.perf_counter()
             stats = self.collect_ppo(self.cfg.ppo_rollout_steps)
+            if torch.cuda.is_initialized():
+                torch.cuda.synchronize(self.device)
+            collected_at = time.perf_counter()
             stats.update(self.ppo_update())
+            if torch.cuda.is_initialized():
+                torch.cuda.synchronize(self.device)
+            updated_at = time.perf_counter()
+            stats.update(
+                collection_time=collected_at - iteration_start,
+                learning_time=updated_at - collected_at,
+                fps=self.cfg.ppo_rollout_steps * self.env.num_envs / (updated_at - iteration_start),
+                eta=(updated_at - start) / (it - first_iteration + 1) * (self.cfg.max_iterations - it - 1),
+            )
             stats.update(
                 lr=self.cfg.ppo_lr,
                 wall_seconds=self.wall_offset + time.perf_counter() - start,
@@ -1080,9 +1104,10 @@ class DexSuperMimicRunner:
                                   ("value", "goals_per_minute", "survival_fraction", "windows")})
                     stats["curriculum/window_episodes"] = performance["seen"].sum().item()
                     stats["curriculum/max_disturbance_speed"] = disturbance_speed_limit(self.env)
-                scalar = organize_log_scalars(stats, it)
+                stats.update(self.ppo_log_stats.scalars())
+                scalar = organize_ppo_scalars(stats, it)
                 self.writer.log_scalars(scalar, it)
-                print(format_training_log(it, self.cfg.max_iterations, scalar), flush=True)
+                print(format_ppo_log(it, self.cfg.max_iterations, scalar), flush=True)
             if (it + 1) % self.cfg.save_interval == 0:
                 self.save(self.log_dir / f"model_{it + 1}.pt", it + 1)
         self.save(self.log_dir / "model_final.pt", self.cfg.max_iterations)
