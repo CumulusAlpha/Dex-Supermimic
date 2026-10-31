@@ -17,6 +17,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task
+from dex_supermimic.tasks.dex_reorient.utils.curriculum import disturbance_speed_limit
 
 from .rotations import mv, quat_to_mat
 from .metrics import MetricLogger
@@ -81,6 +82,9 @@ def organize_log_scalars(scalars, iteration):
             name = LOG_SECTION_RENAMES.get(name, name)
         organized[name] = float(value)
     organized["training/iteration"] = iteration
+    if "wall_seconds" in scalars:
+        organized["training/wall_clock_seconds"] = float(scalars["wall_seconds"])
+        organized["training/wall_clock_minutes"] = float(scalars["wall_seconds"]) / 60.0
     return organized
 
 
@@ -254,12 +258,10 @@ class DexSuperMimicRunner:
         self.wall_offset = 0.0
         self.started_at = time.perf_counter()
         if cfg.algorithm == "ppo":
-            # Curriculum uses the real horizon: rollout_steps per PPO update.
+            # PPO resets episodes automatically; curriculum depends only on real outcomes.
             self.env.cfg.auto_reset = True
-            self.env.max_common_steps = cfg.warmup_steps + cfg.max_iterations * cfg.ppo_rollout_steps
         else:
             self.env.cfg.auto_reset = False
-            self.env.max_common_steps = cfg.warmup_steps + int(cfg.max_iterations / cfg.utd)
         self.step_wm = torch.compile(self.wm) if cfg.compile and str(self.device).startswith("cuda") else self.wm
         self.step_actor = (
             torch.compile(self.actor) if cfg.compile and str(self.device).startswith("cuda") else self.actor
@@ -305,7 +307,7 @@ class DexSuperMimicRunner:
             "base_terms": self.observations.base_terms if self.is_pen else BASE_TERMS,
             "current_terms": {} if self.is_pen else CURRENT_TERMS,
             "wm_history": 1,
-            "critic_history": 1,
+            "critic_history": 1 if self.is_pen else self.observations.critic_history_length,
             "wm_input_dim": self.wm.norm.mean.numel(),
             "critic_input_dim": self.critic.norm.mean.numel(),
             "dynamics_input_dim": dynamics_dim,
@@ -329,8 +331,10 @@ class DexSuperMimicRunner:
             return dict(actor=self.actor, critic=self.ppo_critic)
         return dict(actor=self.actor, wm=self.wm, fail_head=self.fail_head, critic=self.critic)
 
-    def critic_features(self, context):
-        return self.observations.critic(context)
+    def critic_features(self, context, history=None):
+        if self.is_pen:
+            return self.observations.critic(context)
+        return self.observations.critic(context, history)
 
     def replay_dynamics(self, w, x, j):
         """Dynamics features from predicted state; only startup/exogenous context is replayed."""
@@ -388,6 +392,11 @@ class DexSuperMimicRunner:
             m = self.reader.memory()
             auxiliary = self.observations.auxiliary()
             context = self.observations.context(x, m, auxiliary, self.reader.xi)
+            critic_replay = {}
+            if not self.is_pen:
+                critic_replay["critic_history"] = self.observations.critic_history_from_obs(
+                    self._critic_observation()
+                )
             self.actor.norm.update(self.obs[torch.isfinite(self.obs).all(-1)])
             action = (self.actor(self.obs) + self.cfg.action_noise * torch.randn_like(m["a1"])).clamp(-1, 1)
             obs, reward, terminated, truncated, _ = self.env.step(action)
@@ -405,47 +414,49 @@ class DexSuperMimicRunner:
             valid &= torch.isfinite(action).all(-1) & torch.isfinite(self.flatten_memory(m)).all(-1)
             valid &= torch.isfinite(next_x).all(-1) & torch.isfinite(self.obs).all(-1)
             valid &= torch.isfinite(context).all(-1)
+            if not self.is_pen:
+                valid &= torch.isfinite(critic_replay["critic_history"]).all(dim=(-2, -1))
             # Held-out environments never contribute to training statistics.
             train_valid = valid.clone()
             train_valid[self.buffer.train_end :] = False
             self.torque_norm.update(cap["torque"][train_valid])
-            if self.cfg.variant == "fixed":
-                dynamics = self.observations.dynamics(
-                    x[train_valid], self.reader.xi[train_valid], self.observations.disturbance(auxiliary[train_valid])
+            dynamics = self.observations.dynamics(
+                x[train_valid], self.reader.xi[train_valid], self.observations.disturbance(auxiliary[train_valid])
+            )
+            self.wm.norm.update(self.wm.inputs(dynamics, u[train_valid]))
+            self.wm.delta_norm.update(difference(x[train_valid], cap["physics"][train_valid]))
+            with torch.no_grad():
+                selected_m = {key: value[train_valid] for key, value in m.items()}
+                _, next_cage, _ = self.mdp.rewards(
+                    cap["physics"][train_valid],
+                    selected_m,
+                    action[train_valid],
+                    c[train_valid],
+                    cap["contact"][train_valid],
+                    cap["torque"][train_valid],
                 )
-                self.wm.norm.update(self.wm.inputs(dynamics, u[train_valid]))
-                self.wm.delta_norm.update(difference(x[train_valid], cap["physics"][train_valid]))
-                with torch.no_grad():
-                    selected_m = {key: value[train_valid] for key, value in m.items()}
-                    _, next_cage, _ = self.mdp.rewards(
-                        cap["physics"][train_valid],
-                        selected_m,
-                        action[train_valid],
-                        c[train_valid],
-                        cap["contact"][train_valid],
-                        cap["torque"][train_valid],
-                    )
-                    next_memory = self.advance_memory(
-                        cap["physics"][train_valid],
-                        selected_m,
-                        action[train_valid],
-                        c[train_valid],
-                        next_cage,
-                        m["goal"][train_valid].reshape(-1, 3, 3),
-                        soft=False,
-                    )
-                    next_context = self.observations.context(
-                        cap["physics"][train_valid],
-                        next_memory,
-                        auxiliary[train_valid],
-                        self.reader.xi[train_valid],
-                    )
-                self.fail_head.norm.update(
-                    self.fail_head.features(cap["physics"][train_valid], next_context)
+                next_memory = self.advance_memory(
+                    cap["physics"][train_valid],
+                    selected_m,
+                    action[train_valid],
+                    c[train_valid],
+                    next_cage,
+                    m["goal"][train_valid].reshape(-1, 3, 3),
+                    soft=False,
                 )
+                next_context = self.observations.context(
+                    cap["physics"][train_valid],
+                    next_memory,
+                    auxiliary[train_valid],
+                    self.reader.xi[train_valid],
+                )
+            self.fail_head.norm.update(
+                self.fail_head.features(cap["physics"][train_valid], next_context)
+            )
             done = terminated | truncated
             self.buffer.add(
                 dict(
+                    **critic_replay,
                     x=x,
                     x1=cap["physics"],
                     push=next_x - cap["physics"],
@@ -513,20 +524,12 @@ class DexSuperMimicRunner:
         window = c.wm_window
         w = self.buffer.sample(
             c.wm_batch, window, holdout,
-            failure_frac=0.0 if holdout or c.variant == "legacy" else c.wm_failure_frac,
+            failure_frac=0.0 if holdout else c.wm_failure_frac,
             failure_horizon=c.wm_failure_horizon,
         )
         memory = self.unflatten_memory(w["m"][:, 0])
         auxiliary = w["aux"][:, 0]
         simulator = w["sim_context"] if "sim_context" in w else self.reader.xi[w["env"]]
-        if not holdout and c.variant == "legacy":
-            # Deliberately reproduce the old WM statistics bug in the control arm.
-            # The fixed arm never updates statistics from replay.
-            initial_dynamics = self.observations.dynamics(
-                w["x"][:, 0], simulator, self.observations.disturbance(w["aux"][:, 0])
-            )
-            self.wm.norm.update(self.wm.inputs(initial_dynamics, w["u"][:, 0]))
-            self.wm.delta_norm.update(difference(w["x"], w["x1"])[w["mask"].bool()])
         x = w["x"][:, 0]
         losses = []
         state_losses = []
@@ -590,8 +593,6 @@ class DexSuperMimicRunner:
             self.optimize("wm", wm_loss)
         true = self.replay_failure_features(w, simulator)
         predicted = torch.stack(failure_features, 1).detach()
-        if not holdout and c.variant == "legacy":
-            self.fail_head.norm.update(true[w["mask"].bool()])
         failure_logit_true = self.fail_head(true)
         failure_logit_pred = self.fail_head(predicted)
         label = w["terminated"].float()
@@ -692,6 +693,7 @@ class DexSuperMimicRunner:
         x = w["x"]
         m = self.unflatten_memory(w["m"])
         history = self.history_from_obs(w["obs"])
+        critic_history = None if self.is_pen else w["critic_history"]
         auxiliary = w["aux"]
         simulator = w["sim_context"]
         bias = self.reader.robot.data.encoder_bias[w["env"]]
@@ -707,18 +709,17 @@ class DexSuperMimicRunner:
         # These quantities are constant for this update; keep them out of the
         # recurrent loop to avoid repeating host work and Python-side control flow.
         gamma_powers = [c.gamma**t for t in range(horizon + 1)]
-        scale = min(
-            1,
-            max(
-                0,
-                (self.env.common_step_counter / self.env.max_common_steps - 0.05) / 0.75,
-            ),
-        )
-        adaptive = float(getattr(self.env, "_adaptive_episode_curriculum", 0.05))
+        max_disturbance_speed = disturbance_speed_limit(self.env)
         try:
             for t in range(horizon):
                 context = self.task_features(x, m, auxiliary, simulator)
-                xs.append(self.critic_features(context))
+                # The seed comes from real pre-action history. Later frames are
+                # reconstructed from imagined states, preserving actor gradients.
+                if not self.is_pen and t > 0:
+                    critic_history = torch.cat(
+                        (critic_history[:, 1:], context[:, -self.observations.frame_dim:][:, None]), 1
+                    )
+                xs.append(self.critic_features(context, critic_history))
                 a = self.step_actor(self.mdp.flatten_history(history))
                 target, u = self.mdp.control_target(a, m, bias) if self.is_pen else ema_target(
                     a,
@@ -770,7 +771,7 @@ class DexSuperMimicRunner:
                 updated = next_memory
                 # Match interval velocity disturbances independently of the physical model.
                 push = torch.zeros_like(x1)
-                speed = 0.05 + torch.rand(x.shape[0], 1, device=x.device) * 0.1 * scale * adaptive
+                speed = 0.05 + torch.rand(x.shape[0], 1, device=x.device) * (max_disturbance_speed - 0.05)
                 dv = F.normalize(torch.randn(x.shape[0], 3, device=x.device), dim=-1) * speed
                 event = torch.rand(x.shape[0], 1, device=x.device) < self.mdp.dt / 1.2
                 active = event & (
@@ -792,7 +793,11 @@ class DexSuperMimicRunner:
                 )
                 history = torch.cat((history[:, 1:], observation[:, None]), 1)
             context = self.task_features(x, m, auxiliary, simulator)
-            final = self.critic_features(context)
+            if not self.is_pen:
+                critic_history = torch.cat(
+                    (critic_history[:, 1:], context[:, -self.observations.frame_dim:][:, None]), 1
+                )
+            final = self.critic_features(context, critic_history)
             xs.append(final)
             objective = objective + (c.gamma**horizon) * survival * self.critic(final)
             actor_loss = -objective.mean()
@@ -899,6 +904,12 @@ class DexSuperMimicRunner:
                             },
                         }
                     )
+                performance = getattr(self.env, "_performance_disturbance_state", None)
+                if performance is not None:
+                    stats.update({f"curriculum/{key}": performance[key] for key in
+                                  ("value", "goals_per_minute", "survival_fraction", "windows")})
+                    stats["curriculum/window_episodes"] = performance["seen"].sum().item()
+                    stats["curriculum/max_disturbance_speed"] = disturbance_speed_limit(self.env)
                 scalar = organize_log_scalars(stats, it)
                 self.writer.log_scalars(scalar, it)
                 print(format_training_log(it, self.cfg.max_iterations, scalar), flush=True)
@@ -1063,6 +1074,12 @@ class DexSuperMimicRunner:
                 sim_steps=self.sim_steps,
             )
             if it % self.cfg.log_interval == 0:
+                performance = getattr(self.env, "_performance_disturbance_state", None)
+                if performance is not None:
+                    stats.update({f"curriculum/{key}": performance[key] for key in
+                                  ("value", "goals_per_minute", "survival_fraction", "windows")})
+                    stats["curriculum/window_episodes"] = performance["seen"].sum().item()
+                    stats["curriculum/max_disturbance_speed"] = disturbance_speed_limit(self.env)
                 scalar = organize_log_scalars(stats, it)
                 self.writer.log_scalars(scalar, it)
                 print(format_training_log(it, self.cfg.max_iterations, scalar), flush=True)
@@ -1087,14 +1104,7 @@ class DexSuperMimicRunner:
             joint_names=list(self.reader.robot.joint_names),
             wall_seconds=self.wall_offset + time.perf_counter() - self.started_at,
             common_step=self.env.common_step_counter,
-            curriculum_scales={
-                k: getattr(self.env, k)
-                for k in (
-                    "_adaptive_episode_curriculum",
-                    "_reorient_success_curriculum",
-                )
-                if hasattr(self.env, k)
-            },
+            performance_curriculum=getattr(self.env, "_performance_disturbance_state", None),
             cuda_rng=torch.cuda.get_rng_state_all() if str(self.device).startswith("cuda") else None,
             torch_rng=torch.get_rng_state(),
             numpy_rng=np.random.get_state(),
@@ -1104,6 +1114,23 @@ class DexSuperMimicRunner:
         temporary = path.with_suffix(".tmp")
         torch.save(state, temporary)
         temporary.replace(path)
+        # Keep timing next to each weight file, including interrupted/final saves.
+        # Use summary rather than another history row at an already logged step.
+        timing = {
+            "checkpoint": path.name,
+            "iteration": state["iteration"],
+            "sim_steps": state["sim_steps"],
+            "wall_clock_seconds": state["wall_seconds"],
+            "wall_clock_minutes": state["wall_seconds"] / 60.0,
+        }
+        timing_path = path.with_suffix(".timing.json")
+        timing_temporary = timing_path.with_suffix(".tmp")
+        timing_temporary.write_text(json.dumps(timing, indent=2) + "\n")
+        timing_temporary.replace(timing_path)
+        if self.writer.wandb_run is not None:
+            self.writer.wandb_run.summary.update({
+                "checkpoint/" + key: value for key, value in timing.items()
+            })
 
     def close(self):
         self.writer.close()
@@ -1131,6 +1158,24 @@ class DexSuperMimicRunner:
             raise ValueError("Context layout mismatch")
         if state["config"]["control_hz"] != self.cfg.control_hz:
             raise ValueError("Checkpoint control frequency mismatch")
+        if expected_version == 3 and not self.is_pen:
+            saved_dim = state["modules"]["critic"]["norm.mean"].numel()
+            if saved_dim != self.critic.norm.mean.numel():
+                raise ValueError(
+                    "Checkpoint critic history differs from the three-frame reorientation recipe. "
+                    "Start a fresh run or use --model-checkpoint to load only WM/FailureHead."
+                )
+        performance = state.get("performance_curriculum")
+        if not self.is_pen:
+            if performance is None:
+                raise ValueError(
+                    "Checkpoint predates the performance disturbance curriculum. "
+                    "Start a fresh run; legacy time-based runs cannot be resumed under new rules."
+                )
+            if performance["seen"].numel() != self.env.num_envs:
+                raise ValueError("Performance curriculum resume requires the same num_envs")
+            performance["seen"] = performance["seen"].to(self.device)
+            self.env._performance_disturbance_state = performance
         if "torque_norm" in state:
             self.torque_norm.load_state_dict(state["torque_norm"])
         for k, mod in self.modules().items():
@@ -1142,8 +1187,6 @@ class DexSuperMimicRunner:
         self.env.common_step_counter = state.get("common_step", 0)
         self.wall_offset = state.get("wall_seconds", 0.0)
         self.started_at = time.perf_counter()
-        for key, value in state.get("curriculum_scales", {}).items():
-            setattr(self.env, key, value)
         if state.get("cuda_rng") is not None and str(self.device).startswith("cuda"):
             torch.cuda.set_rng_state_all([v.cpu() for v in state["cuda_rng"]])
         torch.set_rng_state(state["torch_rng"].cpu())

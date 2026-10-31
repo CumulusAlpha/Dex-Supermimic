@@ -1,6 +1,6 @@
 # hand2-pen-spin：WM / Actor / Critic 输入输出、递推关系与 Reward
 
-核对日期：2026-10-26。本文对应当前 `hand2-pen-spin`（Wuji Hand 2 参考轨迹转笔）实现，主要对应默认 `variant="fixed"`。结构参照 [Hand 1 reorientation 说明](setting_hand1_reorient.md)。`B` 表示 batch size，表格省略 batch 轴。
+核对日期：2026-10-26。本文对应当前 `hand2-pen-spin`（Wuji Hand 2 参考轨迹转笔）实现。结构参照 [Hand 1 reorientation 说明](setting_hand1_reorient.md)。`B` 表示 batch size，表格省略 batch 轴。
 
 任务配置：[task.py](../../tasks/pen_spin/task.py)、[env_cfgs.py](../../tasks/pen_spin/config/wuji_hand2/env_cfgs.py)。SuperMimic 适配：[pen.py](pen.py)、[runner.py](runner.py)。运行不依赖 `thirdparty/wuji-mjlab` checkout。
 

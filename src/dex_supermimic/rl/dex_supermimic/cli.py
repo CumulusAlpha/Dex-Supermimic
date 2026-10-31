@@ -1,7 +1,10 @@
 """Dedicated entry points; no PPO runner or reference-repository imports."""
 
 import json
+import os
 import random
+import shutil
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +22,20 @@ def train():
 def train_config(cfg, folder=None):
     if not cfg.device.startswith("cuda") or not torch.cuda.is_available():
         raise RuntimeError("Training requires an NVIDIA CUDA GPU.")
+    if cfg.compile or cfg.compile_policy:
+        compiler = os.environ.get("CC")
+        compiler = shutil.which(compiler) if compiler else (shutil.which("gcc") or shutil.which("clang"))
+        if compiler is None:
+            warnings.warn(
+                "No C compiler found for Triton; disabling compile and compile_policy. "
+                "Training will run in eager mode. Install a C compiler (Ubuntu/Debian: "
+                "sudo apt-get install build-essential), or set CC to its executable path "
+                "to enable torch.compile on the next run.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            cfg.compile = False
+            cfg.compile_policy = False
     import warp as wp
     from mjlab.envs import ManagerBasedRlEnv
     from dex_supermimic.tasks.dex_reorient.config.task import make_env_cfg

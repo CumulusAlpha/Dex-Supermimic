@@ -1,6 +1,6 @@
 # hand1-reorient：WM / Actor / Critic 输入输出、递推关系与 Reward
 
-核对日期：2026-10-26。本文仅对应当前 `hand1-reorient`（Wuji Hand 1 方块翻转）实现，主要对应默认 `variant="fixed"`；不以旧实验配置为准。`B` 表示 batch size，省略表格中的 batch 轴。
+核对日期：2026-10-26。本文仅对应当前 `hand1-reorient`（Wuji Hand 1 方块翻转）实现，不以旧实验配置为准。`B` 表示 batch size，省略表格中的 batch 轴。
 
 任务配置：[env_cfgs.py](../../tasks/dex_reorient/config/wuji_hand/env_cfgs.py)、[task.py](../../tasks/dex_reorient/config/wuji_hand/task.py)。
 
@@ -24,7 +24,7 @@ uv run dex-supermimic-train --task hand1-reorient --num-envs 1024 --device cuda:
 | WM 实际网络输入：`[dynamics, u]` | **133** |
 | WM 原始网络输出：`[delta, contact_logits]` | **75 = 52 + 23** |
 | WM `forward()` 返回 | `(x1:58, contact_logits:23)` |
-| Critic 输入：`[task_frame, xi]` | **211 = 165 + 46** |
+| Critic 输入：`[三帧 task_frame, xi]` | **541 = 165 × 3 + 46** |
 | Critic 输出 | 1 |
 
 这些维度已用当前资源实际构建环境并核对。两个 reorientation 手型的 WM 维度相同，但接触维度和 geom 资源不同；更换碰撞几何后，以运行时网络及日志 `input_layout.json`、`context.json` 为准。接触维度来自 `SimReader.contact().shape[-1]`。
@@ -230,7 +230,7 @@ next_dynamics = observations.dynamics(next_x, xi, next_auxiliary[:, 12:21])
 - 每步 `x1` 保持 `[2,58]`，接触输出为 `[2,23]`。
 - 无 push 时，下一步 `dynamics` 前 58 维与上一步 `x1` 逐元素相等。
 - 更新控制记忆和观测历史后，Actor 继续接受 `[2,207]` 并输出 `[2,20]`。
-- Critic 接受 211 维特征，输出 `[2]`；状态、reward、value 均有限。
+- Critic 接受 541 维特征，输出 `[2]`；状态、reward、value 均有限。
 
 该检查确认了**接口与计算图能够递推**，并不证明多步预测误差小或已经具备精确的 Markov 动力学。当前实现还有以下边界：
 
@@ -242,11 +242,11 @@ next_dynamics = observations.dynamics(next_x, xi, next_auxiliary[:, 12:21])
 
 因此，对“能否实现这次输出是下一次输入”的回答是：**物理状态部分可以；完整输入通过解析更新和外生条件补齐后可以。若要求 WM 自身输出所有输入字段、且无需任何保留状态或外部事件，目前不满足这一更强要求。**
 
-## 6. Critic：当前特征 → 状态价值
+## 6. Critic：三帧历史 → 状态价值
 
 代码：[observations.py](observations.py) 的 `frame/context/critic`、[networks.py](networks.py) 的 `Critic`。
 
-Critic 没有三帧历史，输入为 `[task_frame(165), xi]`。`context()` 内部先拼 `[xi, task_frame]`，再由 `critic()` 重排。
+Critic 使用与 PPO 相同的三帧历史：每个 task term 按时间展开后拼接，再附加固定的 `xi`，共 `165 × 3 + 46 = 541` 维。真实采样保存环境的 critic 历史（包含环境 reset 的填充语义），想象 rollout 每步移入递推得到的 clean task frame。WM 与 FailureHead 仍只使用当前帧 context。
 
 | task frame 项 | 维度 | 说明 |
 |---|---:|---|
@@ -266,7 +266,7 @@ Critic 没有三帧历史，输入为 `[task_frame(165), xi]`。`context()` 内�
 当前 `dr_params` 与原环境 critic 的 6 维定义和顺序完全一致。注意这 6 个标量也会出现在 `xi` 开头；`xi` 随后仍保留逐关节 Kp/Kd 比例，用于解析 torque 和提供更细粒度的仿真上下文。
 
 ```text
-RunningNorm(211) → MLP(512,512,256,128; ELU) → Linear(1)
+RunningNorm(541) → MLP(512,512,256,128; ELU) → Linear(1)
 返回 V(s_t): [B]；无 tanh、sigmoid，也不是 Q(s,a)。
 ```
 

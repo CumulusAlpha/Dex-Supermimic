@@ -374,10 +374,6 @@ def build_reorient_events(
                 "min_speed": 0.05,
                 "max_speed": 0.15,
                 "warmup_time_s": 3.0,
-                "warmup_frac": 0.05,
-                "rampup_frac": 0.80,
-                "use_time_ramp": True,
-                "adaptive_curriculum_term": "adaptive_episode",
             },
         ),
         "reset_object_disturbance_force": EventTermCfg(
@@ -607,22 +603,17 @@ def build_reorient_terminations() -> dict[str, TerminationTermCfg]:
 def build_reorient_curriculum() -> dict[str, CurriculumTermCfg]:
     """Build the curriculum term group."""
     return {
-        "success_curriculum": CurriculumTermCfg(
-            func=mdp.reorient_success_curriculum,
+        "performance_disturbance": CurriculumTermCfg(
+            func=mdp.performance_disturbance_curriculum,
             params={
                 "command_name": "reorient_command",
-                "count_threshold": 3,
-                "delta_per_loop": 0.08,
-            },
-        ),
-        "adaptive_episode": CurriculumTermCfg(
-            func=mdp.adaptive_episode_curriculum,
-            params={
-                "target_steps": 800,
-                "inc_rate": 0.1,
-                "dec_rate": 0.2,
-                "min_scale": 0.05,
-                "drop_gamma": 1.0,
+                "target_survival_s": 40.0,
+                "promote_goals_per_minute": 4.5,
+                "demote_goals_per_minute": 1.5,
+                "promote_survival": 0.8,
+                "demote_survival": 0.5,
+                "adjustment": 0.05,
+                "initial_scale": 0.05,
             },
         ),
     }

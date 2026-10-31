@@ -82,7 +82,7 @@ failure:      reads recursively derived privileged features
   action / disturbance，预测 transition 后的 `x1`；FailureHead 输入对应的
   **post-transition** `x1 / S_hat` 单帧 derived privileged features，预测该 transition
   是否发生真实 termination。
-- Critic 只用当前一帧 task context；`task.py` 已把 critic terms history 设为 1。
+- Reorientation Critic 与 PPO 一样使用 3 帧 task term history，再附加固定仿真上下文；真实历史来自环境，想象历史由预测状态递推。下文保留的旧单帧维度示例请以 `setting_hand1_reorient.md` / `setting_hand2_reorient.md` 与运行时 `input_layout.json` 为准。
 - Actor 不使用 simulator privileged context。
 - WM、FailureHead、Critic 使用 startup simulator privileged context。
 

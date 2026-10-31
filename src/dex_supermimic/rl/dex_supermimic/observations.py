@@ -1,6 +1,6 @@
 """Differentiable clean task observations for real and imagined states.
 
-Both critic and dynamics use only the current frame, including simulator context.
+Dynamics and FailureHead use the current frame; the critic stacks three task frames.
 """
 
 import torch
@@ -53,6 +53,7 @@ LEGACY_FRAME_DIM = BASE_DIM + LEGACY_CURRENT_DIM
 
 class TaskObservations:
     base_terms = BASE_TERMS
+    critic_history_length = 3
 
     def __init__(self, reader, legacy_context=False):
         self.reader = reader
@@ -171,6 +172,23 @@ class TaskObservations:
             -1,
         )
 
-    def critic(self, context):
-        """Move the trailing task frame ahead of simulator context."""
-        return torch.cat((context[..., -self.frame_dim :], context[..., : -self.frame_dim]), -1)
+    def critic_history_from_obs(self, observation):
+        """Decode the environment's term-major history without advancing it."""
+        dims = tuple(self.base_terms.values()) + tuple(self.current_terms.values())
+        length = self.critic_history_length
+        return torch.cat(
+            [
+                part.unflatten(-1, (length, dim))
+                for part, dim in zip(observation.split([length * dim for dim in dims], -1), dims)
+            ],
+            -1,
+        )
+
+    def critic(self, context, history=None):
+        """Flatten each term's three frames as PPO does, then append fixed xi."""
+        frame = context[..., -self.frame_dim:]
+        if history is None:
+            history = frame.unsqueeze(-2).expand(*frame.shape[:-1], self.critic_history_length, -1)
+        dims = tuple(self.base_terms.values()) + tuple(self.current_terms.values())
+        stacked = torch.cat([part.flatten(-2) for part in history.split(dims, -1)], -1)
+        return torch.cat((stacked, context[..., :-self.frame_dim]), -1)

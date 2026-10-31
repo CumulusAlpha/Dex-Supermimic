@@ -27,7 +27,7 @@ class DexSuperMimicCfg:
     num_envs: int = 1024
     """Number of parallel simulator environments; shared by every supported task."""
     control_hz: int = 50
-    max_iterations: int = 8_000
+    max_iterations: int = 10_000
     """Total training iterations; shared by every supported task."""
     buffer_steps: int = 1000
     warmup_steps: int = 64
@@ -42,7 +42,6 @@ class DexSuperMimicCfg:
     contact_weight: float = 0.1
     model_checkpoint: str | None = None
     reset_model_statistics: bool = False
-    variant: str = "fixed"
     wm_batches: int = 10
     wm_batch: int = 2048
     wm_hidden: tuple[int, ...] = (2048, 2048, 2048)
@@ -106,8 +105,6 @@ class DexSuperMimicCfg:
             v < 0 for v in (self.final_state_weight, self.contact_weight)
         ):
             raise ValueError("Loss weights must be nonnegative")
-        if self.variant not in ("fixed", "legacy"):
-            raise ValueError("variant must be fixed or legacy")
         if self.checkpoint and self.model_checkpoint:
             raise ValueError("Choose resume or model-only initialization")
         if not 0 <= self.wm_failure_frac < 1:
@@ -151,8 +148,6 @@ class DexSuperMimicCfg:
                 raise ValueError("PPO is currently restricted to hand2-reorient")
             if self.control_hz != 50:
                 raise ValueError("PPO exactly matches WujiHand2_Reorient_50Hz, not the 20Hz task")
-            if self.checkpoint:
-                raise ValueError("PPO checkpoints require a format_version=4 PPO checkpoint")
             if self.model_checkpoint:
                 raise ValueError("model_checkpoint is incompatible with PPO training")
             for name in ("ppo_rollout_steps", "ppo_epochs", "ppo_minibatches"):

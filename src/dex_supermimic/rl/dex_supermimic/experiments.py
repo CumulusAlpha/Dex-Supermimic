@@ -1,8 +1,8 @@
-"""Matched original-task A/B training and real-simulator evaluation.
+"""Multi-seed original-task training and real-simulator evaluation.
 
 python -m dex_supermimic.rl.dex_supermimic.experiments --help
 Preparation writes a reproducible manifest without starting expensive training.
---execute runs all paired seeds, then evaluates each with common held-out seeds.
+--execute runs all training seeds, then evaluates each with common held-out seeds.
 """
 
 import json
@@ -17,7 +17,7 @@ from .config import DexSuperMimicCfg
 
 @dataclass
 class ExperimentConfig:
-    output: str = "logs/dex_supermimic_ab"
+    output: str = "logs/dex_supermimic_experiments"
     seeds: tuple[int, ...] = (42, 43, 44)
     eval_seeds: tuple[int, ...] = (1001, 1002, 1003)
     eval_steps: int = 2000
@@ -97,6 +97,7 @@ def evaluate(checkpoint, seed, steps, num_envs=64, device="cuda:0"):
     cfg = make_env_cfg(num_envs, state["config"]["control_hz"], play=False, task=checkpoint_task(state["config"]))
     cfg.seed = seed
     cfg.auto_reset = False
+    cfg.curriculum.clear()  # Fixed full difficulty, independent of policy performance.
     env = ManagerBasedRlEnv(cfg, device=device)
     actor = Actor().to(device)
     actor.load_state_dict(state["modules"]["actor"])
@@ -104,18 +105,6 @@ def evaluate(checkpoint, seed, steps, num_envs=64, device="cuda:0"):
     reader = None
     try:
         obs = env.reset()[0]["policy"]
-        # Evaluate with the final training curriculum, shared between both arms.
-        env.max_common_steps = (
-            state["config"]["warmup_steps"] + (
-                int(state["config"]["max_iterations"] / state["config"]["utd"])
-                if "utd" in state["config"] else state["config"]["max_iterations"] * state["config"]["collect_steps"]
-            )
-        )
-        env.common_step_counter = env.max_common_steps
-        # A shared final curriculum prevents policy-dependent training progress
-        # from changing the difficulty of one evaluation arm.
-        for key in ("_adaptive_episode_curriculum", "_reorient_success_curriculum"):
-            setattr(env, key, 1.0)
         reader = SimReader(env)
         reader.attach_capture()
         angles, gains, rewards = [], [], []
@@ -157,70 +146,36 @@ def evaluate(checkpoint, seed, steps, num_envs=64, device="cuda:0"):
         env.close()
 
 
-def summarize_ab(results):
-    """Strict paired-seed acceptance; never treat missing runs as a pass."""
-    pairs = {}
-    for row in results:
-        pairs.setdefault(row["train_seed"], {})[row["variant"]] = row["evaluation"]
-    output = []
-    for seed, arms in pairs.items():
-        if set(arms) != {"legacy", "fixed"}:
-            output.append(dict(seed=seed, passed=False, reason="missing arm"))
-            continue
-        if {v["seed"] for v in arms["fixed"]} != {v["seed"] for v in arms["legacy"]}:
-            raise ValueError("A/B evaluation seeds differ")
-        mean = lambda arm, key: float(np.mean([v[key] for v in arms[arm]]))
-        angle_gain = mean("legacy", "angle_rad_mean") - mean("fixed", "angle_rad_mean")
-        goal_gain = mean("fixed", "goals_reached") - mean("legacy", "goals_reached")
-        direction = all(
-            v["goal_reversal"]["positive/signed_axis_rotation_rad"] > 0
-            and v["goal_reversal"]["negative/signed_axis_rotation_rad"] < 0
-            for v in arms["fixed"]
-        )
-        output.append(
-            dict(
-                seed=seed,
-                angle_gain_rad=angle_gain,
-                goals_gain=goal_gain,
-                goal_direction_passed=direction,
-                passed=angle_gain > 0 and goal_gain > 0 and direction,
-            )
-        )
-    return dict(paired_seeds=output, passed=len(output) >= 3 and all(v["passed"] for v in output))
-
-
 def main():
     cfg = tyro.cli(ExperimentConfig)
     if len(set(cfg.seeds)) < 3:
-        raise ValueError("Final A/B validation requires at least three distinct training seeds")
+        raise ValueError("Multi-seed validation requires at least three distinct training seeds")
     if not cfg.eval_seeds or cfg.eval_steps < 1:
         raise ValueError("Evaluation seeds and positive steps are required")
     base = DexSuperMimicCfg(**json.loads(Path(cfg.base_config).read_text())) if cfg.base_config else DexSuperMimicCfg()
     if base.checkpoint:
-        raise ValueError("A/B must initialize actor and critic fresh; use model_checkpoint")
+        raise ValueError("Experiments must initialize actor and critic fresh; use model_checkpoint")
     output = Path(cfg.output)
     output.mkdir(parents=True, exist_ok=True)
     runs = []
     for seed in cfg.seeds:
-        for variant in ("legacy", "fixed"):
-            folder = output / f"{variant}_seed{seed}"
-            train_cfg = replace(
-                base,
-                seed=seed,
-                variant=variant,
-                checkpoint=None,
-                model_checkpoint=cfg.model_checkpoint or base.model_checkpoint,
-                reset_model_statistics=variant == "fixed" and bool(cfg.model_checkpoint or base.model_checkpoint),
-                log_dir=str(folder),
-                logger="none",
-                wandb_mode=None,
-            )
-            runs.append(dict(folder=str(folder), config=train_cfg.to_dict()))
+        folder = output / f"seed{seed}"
+        train_cfg = replace(
+            base,
+            seed=seed,
+            checkpoint=None,
+            model_checkpoint=cfg.model_checkpoint or base.model_checkpoint,
+            reset_model_statistics=bool(cfg.model_checkpoint or base.model_checkpoint),
+            log_dir=str(folder),
+            logger="none",
+            wandb_mode=None,
+        )
+        runs.append(dict(folder=str(folder), config=train_cfg.to_dict()))
     manifest = dict(
         training_seeds=cfg.seeds,
         evaluation_seeds=cfg.eval_seeds,
         eval_steps=cfg.eval_steps,
-        initialization="same actor/critic seed per pair; model-only checkpoint optional",
+        initialization="fresh actor/critic per training seed; model-only checkpoint optional",
         real_transitions=base.num_envs
         * (max(base.warmup_steps, base.wm_window) + int(base.max_iterations / base.utd)),
         runs=runs,
@@ -240,11 +195,9 @@ def main():
             train_config(DexSuperMimicCfg(**run["config"]), folder)
         checkpoint = folder / "model_final.pt"
         evaluations = [evaluate(checkpoint, seed, cfg.eval_steps, device=base.device) for seed in cfg.eval_seeds]
-        results.append(dict(variant=run["config"]["variant"], train_seed=run["config"]["seed"], evaluation=evaluations))
+        results.append(dict(train_seed=run["config"]["seed"], evaluation=evaluations))
         (output / "results.json").write_text(json.dumps(results, indent=2))
-    summary = summarize_ab(results)
-    (output / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(json.dumps(summary, indent=2))
+    print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":

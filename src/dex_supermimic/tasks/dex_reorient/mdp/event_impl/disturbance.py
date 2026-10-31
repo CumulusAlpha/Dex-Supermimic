@@ -7,10 +7,7 @@ from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 from dex_supermimic.tasks.dex_reorient.mdp._env_utils import resolve_env_ids
-from dex_supermimic.tasks.dex_reorient.mdp.curriculums import (
-    get_curriculum_value,
-    get_linear_progress,
-)
+from dex_supermimic.tasks.dex_reorient.utils.curriculum import disturbance_speed_limit
 from dex_supermimic.tasks.dex_reorient.mdp.runtime_state import get_reorient_runtime_state
 
 _DEFAULT_OBJECT_CFG = SceneEntityCfg("object")
@@ -23,31 +20,11 @@ def apply_velocity_disturbance(
     min_speed: float = 0.05,
     max_speed: float = 0.15,
     warmup_time_s: float = 3.0,
-    warmup_frac: float = 0.05,
-    rampup_frac: float = 0.80,
-    adaptive_curriculum_term: str = "",
-    use_time_ramp: bool = True,
 ) -> None:
     env_ids = resolve_env_ids(env, env_ids)
     if env_ids.numel() == 0:
         return
-
-    if use_time_ramp:
-        linear_progress = get_linear_progress(
-            env,
-            warmup_frac=warmup_frac,
-            rampup_frac=rampup_frac,
-        )
-    else:
-        linear_progress = 1.0
-    adaptive_scale = 1.0
-    if adaptive_curriculum_term:
-        adaptive_scale = get_curriculum_value(env, adaptive_curriculum_term, 1.0)
-
-    curr_max_speed = (
-        float(min_speed)
-        + (float(max_speed) - float(min_speed)) * linear_progress * adaptive_scale
-    )
+    curr_max_speed = disturbance_speed_limit(env, min_speed, max_speed)
     state = get_reorient_runtime_state(env)
     assert state.pert_force_dir is not None
     assert state.pert_velocity_cache is not None

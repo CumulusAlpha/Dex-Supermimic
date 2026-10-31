@@ -41,6 +41,8 @@ The implementation is task-aware: cube reorientation uses command/goal observati
 - Linux x86_64 with an NVIDIA GPU is required for training and playback. CUDA 12.8 is tested; Blackwell/RTX 50-series GPUs are supported by MuJoCo Warp.
 - macOS arm64 can install and import the package, but training intentionally rejects non-CUDA devices.
 - Python 3.10–3.13 is selected automatically by `uv`.
+- GCC or Clang is needed for Triton / `torch.compile`. On Ubuntu/Debian, install it with `sudo apt-get update && sudo apt-get install build-essential`. If the compiler is outside `PATH`, set `CC=/absolute/path/to/gcc`. Without a compiler, training automatically disables `compile` and `compile_policy` and runs in eager mode, which may be slower.
+- Triton also needs development headers matching the training Python version. For system Python 3.12 on Ubuntu/Debian, run `sudo apt-get install python3.12-dev`. A `fatal error: Python.h: No such file or directory` means these headers are missing.
 - At least one CUDA-capable GPU with enough memory for the requested parallel environment count. `--num-envs 1024` is the default starting point.
 - Disk space for the virtual environment, Wuji meshes, pen-spin motion catalog, checkpoints, and TensorBoard events.
 
@@ -77,6 +79,25 @@ Run from the repository root. The first launch may spend extra time compiling Wa
 # task: hand1-reorient | hand2-reorient | hand2-pen-spin
 uv run dex-supermimic-train --task hand1-reorient
 ```
+
+To train Hand 2 with W&B logging, authenticate once with `uv run wandb login`, then run:
+
+```bash
+uv run dex-supermimic-train \
+  --task hand2-reorient \
+  --algorithm world_model \
+  --control-hz 50 \
+  --num-envs 2048 \
+  --max-iterations 10000 \
+  --save-interval 1000 \
+  --logger wandb \
+  --wandb-project dex-supermimic \
+  --wandb-entity cumulusalpha
+```
+
+Set `--wandb-entity` to your W&B user or team. Use `--wandb-mode offline` to save W&B logs locally without signing in. TensorBoard remains the default logger. To explicitly disable PyTorch compilation, pass both `--no-compile --no-compile-policy`.
+
+Reorientation uses a shared performance curriculum for PPO and SuperMimic: real goal completion and survival determine disturbance strength, independently of the iteration budget. Checkpoints preserve curriculum state for continuation with `--checkpoint`. See [comparison and curriculum settings](docs/experiments/reorientation_comparison.md). Legacy time-curriculum checkpoints cannot resume under the new rules.
 
 Before training `hand2-pen-spin`, download its upstream motion catalog:
 

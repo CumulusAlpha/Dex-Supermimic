@@ -28,3 +28,14 @@ def get_curriculum_value(env, term_name: str, default: float = 1.0) -> float:
             return first.mean().item() if first.numel() > 0 else default
         return float(first)
     return float(value)
+
+
+def disturbance_speed_limit(env, min_speed: float = 0.05, max_speed: float = 0.15) -> float:
+    """Single source of difficulty for real and imagined reorientation pushes.
+
+    Missing curriculum (e.g. fixed evaluation) means full difficulty. Read the
+    authoritative state directly so checkpoint restoration takes effect at once.
+    """
+    state = getattr(env, "_performance_disturbance_state", None)
+    scale = 1.0 if state is None else float(state["value"])
+    return float(min_speed) + (float(max_speed) - float(min_speed)) * max(0.0, min(scale, 1.0))
