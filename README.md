@@ -119,6 +119,13 @@ Inspect TensorBoard curves with:
 uv run tensorboard --logdir logs/dex_supermimic
 ```
 
+## Standalone PPO Training
+
+For a standalone PPO baseline using the installed rsl-rl training loop, run
+`uv run dex-ppo-train --num-envs 4096 --device cuda:0 --max-iterations 10000`.
+See [PPO training](docs/ppo_training.md) for configuration scope, KL diagnostics,
+resume, and playback instructions.
+
 ## Pretrained Checkpoint
 
 Pretrained checkpoints are distributed separately as GitHub Release attachments. The `_8000` suffix indicates that these checkpoints were saved after 8,000 training iterations:

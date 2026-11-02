@@ -930,6 +930,8 @@ class DexSuperMimicRunner:
                 "obs": self.obs.new_empty(steps, self.env.num_envs, obs_dim),
                 "critic_obs": self.obs.new_empty(steps, self.env.num_envs, self.ppo_critic.norm._mean.shape[-1]),
                 "actions": self.obs.new_empty(steps, self.env.num_envs, action_dim),
+                "action_mean": self.obs.new_empty(steps, self.env.num_envs, action_dim),
+                "action_std": self.obs.new_empty(steps, self.env.num_envs, action_dim),
                 "log_prob": self.obs.new_empty(steps, self.env.num_envs),
                 "value": self.obs.new_empty(steps, self.env.num_envs),
                 "reward": self.obs.new_empty(steps, self.env.num_envs),
@@ -967,6 +969,8 @@ class DexSuperMimicRunner:
             memory["obs"][t] = self.obs
             memory["critic_obs"][t] = critic_obs
             memory["actions"][t] = action
+            memory["action_mean"][t] = distribution.mean
+            memory["action_std"][t] = distribution.stddev
             memory["log_prob"][t] = distribution.log_prob(action).sum(-1)
             memory["value"][t] = value
             memory["reward"][t] = reward
@@ -1034,8 +1038,12 @@ class DexSuperMimicRunner:
                 ids = permutation[start : start + minibatch_size]
                 distribution = self.actor.distribution(flat_actor_obs[ids])
                 log_prob = distribution.log_prob(flat_actions[ids]).sum(-1)
-                with torch.no_grad():
-                    old_distribution = self.actor.distribution(flat_actor_obs[ids])
+                # Compare with the policy that actually collected these actions,
+                # including its observation-normalization statistics at that time.
+                old_distribution = torch.distributions.Normal(
+                    memory["action_mean"].reshape(count, -1)[ids],
+                    memory["action_std"].reshape(count, -1)[ids],
+                )
                 ratio = (log_prob - flat_old_log_prob[ids]).exp()
                 policy_loss = -torch.min(
                     ratio * flat_advantages[ids],
@@ -1047,9 +1055,8 @@ class DexSuperMimicRunner:
                 loss = policy_loss + c.ppo_value_coef * value_loss - c.ppo_entropy * entropy
                 self.optimizers["ppo"].zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(
-                    tuple(self.actor.parameters()) + tuple(critic.parameters()), c.ppo_max_grad_norm
-                )
+                nn.utils.clip_grad_norm_(self.actor.parameters(), c.ppo_max_grad_norm)
+                nn.utils.clip_grad_norm_(critic.parameters(), c.ppo_max_grad_norm)
                 self.optimizers["ppo"].step()
                 with torch.no_grad():
                     clip_fractions.append(((ratio - 1.0).abs() > c.ppo_clip).float().mean())

@@ -21,12 +21,14 @@ dependencies = [
   "mujoco-warp~=3.11.0",
   "mujoco~=3.11.0",
   "mjlab==1.6.0",
+  "rsl-rl-lib==5.4.2",
   "wuji-description",
 ]
 
 [project.scripts]
 dex-supermimic-train = "dex_supermimic.rl.dex_supermimic.cli:train"
 dex-supermimic-play = "dex_supermimic.rl.dex_supermimic.cli:play"
+dex-ppo-train = "dex_supermimic.rl.ppo:train"
 
 [tool.uv]
 environments = [
