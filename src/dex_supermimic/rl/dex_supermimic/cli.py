@@ -89,6 +89,28 @@ class PlayConfig:
     export_onnx: str | None = None
 
 
+def _load_play_actor(checkpoint, device):
+    """Restore the normalization implementation stored with the policy."""
+    from .common import RunningNorm
+    from .networks import Actor, GaussianPPOActor
+
+    if checkpoint.get("format_version") not in (1, 2, 3, 4):
+        raise ValueError("Unsupported checkpoint format")
+    state = checkpoint["modules"]["actor"]
+    empirical_norm = "norm._mean" in state
+    obs_dim = state["norm._mean" if empirical_norm else "norm.mean"].numel()
+    if checkpoint["format_version"] == 4:
+        actor = GaussianPPOActor(obs_dim, state["net.6.bias"].numel() // 2)
+    else:
+        actor = Actor(obs_dim)
+    if not empirical_norm:
+        actor.norm = RunningNorm(obs_dim)
+    actor = actor.to(device)
+    actor.load_state_dict(state)
+    actor.eval()
+    return actor, obs_dim
+
+
 def play():
     cfg = tyro.cli(PlayConfig)
     if cfg.viewer and cfg.viser:
@@ -103,29 +125,19 @@ def play():
         os.environ.setdefault("MUJOCO_GL", "egl")
     from mjlab.envs import ManagerBasedRlEnv
     from dex_supermimic.tasks.dex_reorient.config.task import checkpoint_task, make_env_cfg
-    from .networks import Actor, GaussianPPOActor
 
     checkpoint = torch.load(cfg.checkpoint, map_location=cfg.device, weights_only=False)
     task = checkpoint_task(checkpoint["config"])
     is_ppo = checkpoint.get("format_version") == 4
-    if checkpoint.get("format_version") not in (1, 2, 3, 4):
-        raise ValueError("Unsupported checkpoint format")
     is_pen = task == "hand2-pen-spin"
-    state = checkpoint["modules"]["actor"]
-    if is_ppo:
-        actor = GaussianPPOActor(state["norm._mean"].shape[-1], state["net.6.bias"].numel() // 2)
-    else:
-        actor = Actor(state["norm.mean"].numel())
-    actor = actor.to(cfg.device)
-    actor.load_state_dict(state)
-    actor.eval()
+    actor, obs_dim = _load_play_actor(checkpoint, cfg.device)
     policy_actor = actor.mean if is_ppo else actor
     if cfg.export_onnx:
         path = Path(cfg.export_onnx)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.onnx.export(
             policy_actor,
-            torch.zeros(1, state["norm.mean"].numel(), device=cfg.device),
+            torch.zeros(1, obs_dim, device=cfg.device),
             str(path),
             input_names=["policy"],
             output_names=["action"],

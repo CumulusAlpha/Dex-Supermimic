@@ -126,6 +126,19 @@ For a standalone PPO baseline using the installed rsl-rl training loop, run
 See [PPO training](docs/ppo_training.md) for configuration scope, KL diagnostics,
 resume, and playback instructions.
 
+## Evaluate Saved Policies
+
+Compute undiscounted episode returns from SuperMimic or PPO weights without training:
+
+```bash
+.venv/bin/python evaluate_return.py --checkpoint <checkpoint.pt>
+```
+
+Defaults: 3 evaluation seeds, 32 episodes per seed, 40 seconds per episode,
+deterministic actions, and fixed full difficulty with domain randomization.
+Results are saved beside the checkpoint as `<checkpoint>.evaluation.json` (replacing `.pt`).
+See [evaluation instructions](docs/evaluation_return.md) for both trained checkpoints and metric definitions.
+
 ## Pretrained Checkpoint
 
 Pretrained checkpoints are distributed separately as GitHub Release attachments. The `_8000` suffix indicates that these checkpoints were saved after 8,000 training iterations:

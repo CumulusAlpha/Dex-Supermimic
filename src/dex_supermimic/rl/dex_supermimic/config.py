@@ -93,6 +93,8 @@ class DexSuperMimicCfg:
     """Discount matching WujiHand2_Reorient_50Hz."""
 
     def __post_init__(self):
+        if self.algorithm == "ppo" and self.log_dir == "logs/dex_supermimic":
+            self.log_dir = "logs/ppo"
         if self.task not in ("hand1-reorient", "hand2-reorient", "hand2-pen-spin"):
             raise ValueError(f"Unknown task: {self.task!r}")
         if self.task == "hand2-pen-spin" and self.control_hz != 50:
